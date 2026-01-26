@@ -1,0 +1,69 @@
+fingerproxy源码修改：
+
+1. git clone https://github.com/wi1dcard/fingerproxy.git
+
+2. 修改HTTP2FingerprintingFrames结构(pkg/metadata/http2.go):
+type HTTP2FingerprintingFrames struct {
+	// Data from SETTINGS frame
+	Settings []Setting
+
+	// Increment of WINDOW_UPDATE frame
+	WindowUpdateIncrement uint32
+
+	// PRIORITY frame(s)
+	Priorities []Priority
+
+	// HEADERS frame
+	Headers []HeaderField
+
+	// Added by Lynn: Headers order string, for debugging
+    HeaderOrder string
+}
+
+3. 修改metadata输出(pkg/http2/server.go):
+
+func (sc *serverConn) processFrame(f Frame) error {
+	// ...
+	case *MetaHeadersFrame:
+	if md, ok := metadata.FromContext(sc.baseCtx); ok {
+		headers := []metadata.HeaderField{}
+		for _, h := range f.Fields {
+			headers = append(headers, metadata.HeaderField(h))
+		}
+		md.HTTP2Frames.Headers = headers
+		// Added by Lynn: Build header order string (header names only)
+		var b strings.Builder
+		for i, hf := range headers {
+		    if i > 0 {
+		        b.WriteString("--->")
+		    }
+		    b.WriteString(hf.Name)
+		}
+		md.HTTP2Frames.HeaderOrder = b.String()
+		// End Added
+		if f.HasPriority() {
+			md.HTTP2Frames.Priorities = append(md.HTTP2Frames.Priorities,
+				metadata.Priority{
+					StreamId:  f.StreamID,
+					StreamDep: f.Priority.StreamDep,
+					Exclusive: f.Priority.Exclusive,
+					Weight:    f.Priority.Weight,
+				})
+		}
+	}
+	return sc.processHeaders(f)
+}
+
+4. 测试。
+编译echo-server，执行: "go build -o echo-server ./example/echo-server", 得到可执行文件echo-server，生成tls.key、tls.crt，运行: “./echo-server ”
+
+5. 使用ja3clicker访问https://localhost:8443/json/detail，返回的json数据中关键部分：
+{
+  "detail": {
+    "metadata": {
+      "HTTP2Frames": {
+        "HeaderOrder": ":method--->:scheme--->:path--->:authority--->accept-encoding--->accept-language--->user-agent--->priority--->accept--->sec-fetch-site--->sec-fetch-dest--->sec-fetch-mode"
+      }
+   }
+}
+这里我用的是"--->"分隔header name, 你们也可以用其他的做分隔符.

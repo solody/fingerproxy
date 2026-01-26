@@ -1631,6 +1631,18 @@ func (sc *serverConn) processFrame(f Frame) error {
 				headers = append(headers, metadata.HeaderField(h))
 			}
 			md.HTTP2Frames.Headers = headers
+
+			// Added by Lynn: Build header order string (header names only)
+			var b strings.Builder
+			for i, hf := range headers {
+				if i > 0 {
+					b.WriteString("--->")
+				}
+				b.WriteString(hf.Name)
+			}
+			md.HTTP2Frames.HeaderOrder = b.String()
+			// End Added
+
 			if f.HasPriority() {
 				md.HTTP2Frames.Priorities = append(md.HTTP2Frames.Priorities,
 					metadata.Priority{

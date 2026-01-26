@@ -38,6 +38,9 @@ type HTTP2FingerprintingFrames struct {
 
 	// HEADERS frame
 	Headers []HeaderField
+
+	// Added by Lynn: Headers order string, for debugging
+	HeaderOrder string
 }
 
 func (f *HTTP2FingerprintingFrames) String() string {
