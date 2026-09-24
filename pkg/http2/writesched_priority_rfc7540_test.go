@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !(go1.27 && !http2legacy)
+
 package http2
 
 import (
@@ -11,11 +13,11 @@ import (
 	"testing"
 )
 
-func defaultPriorityWriteScheduler() *priorityWriteScheduler {
-	return NewPriorityWriteScheduler(nil).(*priorityWriteScheduler)
+func defaultPriorityWriteScheduler() *priorityWriteSchedulerRFC7540 {
+	return NewPriorityWriteScheduler(nil).(*priorityWriteSchedulerRFC7540)
 }
 
-func checkPriorityWellFormed(ws *priorityWriteScheduler) error {
+func checkPriorityWellFormed(ws *priorityWriteSchedulerRFC7540) error {
 	for id, n := range ws.nodes {
 		if id != n.id {
 			return fmt.Errorf("bad ws.nodes: ws.nodes[%d] = %d", id, n.id)
@@ -40,7 +42,7 @@ func checkPriorityWellFormed(ws *priorityWriteScheduler) error {
 	return nil
 }
 
-func fmtTree(ws *priorityWriteScheduler, fmtNode func(*priorityNode) string) string {
+func fmtTree(ws *priorityWriteSchedulerRFC7540, fmtNode func(*priorityNodeRFC7540) string) string {
 	var ids []int
 	for _, n := range ws.nodes {
 		ids = append(ids, int(n.id))
@@ -61,7 +63,7 @@ func fmtTree(ws *priorityWriteScheduler, fmtNode func(*priorityNode) string) str
 	return buf.String()
 }
 
-func fmtNodeParentSkipRoot(n *priorityNode) string {
+func fmtNodeParentSkipRoot(n *priorityNodeRFC7540) string {
 	switch {
 	case n.id == 0:
 		return ""
@@ -72,7 +74,7 @@ func fmtNodeParentSkipRoot(n *priorityNode) string {
 	}
 }
 
-func fmtNodeWeightParentSkipRoot(n *priorityNode) string {
+func fmtNodeWeightParentSkipRoot(n *priorityNodeRFC7540) string {
 	switch {
 	case n.id == 0:
 		return ""
@@ -158,7 +160,7 @@ func TestPriorityAdjustOwnParent(t *testing.T) {
 }
 
 func TestPriorityClosedStreams(t *testing.T) {
-	ws := NewPriorityWriteScheduler(&PriorityWriteSchedulerConfig{MaxClosedNodesInTree: 2}).(*priorityWriteScheduler)
+	ws := NewPriorityWriteScheduler(&PriorityWriteSchedulerConfig{MaxClosedNodesInTree: 2}).(*priorityWriteSchedulerRFC7540)
 	ws.OpenStream(1, OpenStreamOptions{})
 	ws.OpenStream(2, OpenStreamOptions{PusherID: 1})
 	ws.OpenStream(3, OpenStreamOptions{PusherID: 2})
@@ -196,7 +198,7 @@ func TestPriorityClosedStreams(t *testing.T) {
 }
 
 func TestPriorityClosedStreamsDisabled(t *testing.T) {
-	ws := NewPriorityWriteScheduler(&PriorityWriteSchedulerConfig{}).(*priorityWriteScheduler)
+	ws := NewPriorityWriteScheduler(&PriorityWriteSchedulerConfig{}).(*priorityWriteSchedulerRFC7540)
 	ws.OpenStream(1, OpenStreamOptions{})
 	ws.OpenStream(2, OpenStreamOptions{PusherID: 1})
 	ws.OpenStream(3, OpenStreamOptions{PusherID: 2})
@@ -215,7 +217,7 @@ func TestPriorityClosedStreamsDisabled(t *testing.T) {
 }
 
 func TestPriorityIdleStreams(t *testing.T) {
-	ws := NewPriorityWriteScheduler(&PriorityWriteSchedulerConfig{MaxIdleNodesInTree: 2}).(*priorityWriteScheduler)
+	ws := NewPriorityWriteScheduler(&PriorityWriteSchedulerConfig{MaxIdleNodesInTree: 2}).(*priorityWriteSchedulerRFC7540)
 	ws.AdjustStream(1, PriorityParam{StreamDep: 0, Weight: 15}) // idle
 	ws.AdjustStream(2, PriorityParam{StreamDep: 0, Weight: 15}) // idle
 	ws.AdjustStream(3, PriorityParam{StreamDep: 2, Weight: 20}) // idle
@@ -236,7 +238,7 @@ func TestPriorityIdleStreams(t *testing.T) {
 }
 
 func TestPriorityIdleStreamsDisabled(t *testing.T) {
-	ws := NewPriorityWriteScheduler(&PriorityWriteSchedulerConfig{}).(*priorityWriteScheduler)
+	ws := NewPriorityWriteScheduler(&PriorityWriteSchedulerConfig{}).(*priorityWriteSchedulerRFC7540)
 	ws.AdjustStream(1, PriorityParam{StreamDep: 0, Weight: 15}) // idle
 	ws.AdjustStream(2, PriorityParam{StreamDep: 0, Weight: 15}) // idle
 	ws.AdjustStream(3, PriorityParam{StreamDep: 2, Weight: 20}) // idle
@@ -295,7 +297,7 @@ func TestPrioritySection531Exclusive(t *testing.T) {
 	}
 }
 
-func makeSection533Tree() *priorityWriteScheduler {
+func makeSection533Tree() *priorityWriteSchedulerRFC7540 {
 	// Initial tree from RFC 7540 Section 5.3.3.
 	// A,B,C,D,E,F = 1,2,3,4,5,6
 	ws := defaultPriorityWriteScheduler()
@@ -548,6 +550,39 @@ func TestPriorityWeights(t *testing.T) {
 	}
 }
 
+func TestPriorityWeightsMinMax(t *testing.T) {
+	ws := defaultPriorityWriteScheduler()
+	ws.OpenStream(1, OpenStreamOptions{})
+	ws.OpenStream(2, OpenStreamOptions{})
+
+	sc := &serverConn{maxFrameSize: 8}
+	st1 := &stream{id: 1, sc: sc}
+	st2 := &stream{id: 2, sc: sc}
+	st1.flow.add(40)
+	st2.flow.add(40)
+
+	// st2 gets 256x the bandwidth of st1 (256 = (255+1)/(0+1)).
+	// The maximum frame size is 8 bytes. The write sequence should be:
+	//   st2, total bytes so far is (st1=0,  st=8)
+	//   st1, total bytes so far is (st1=8,  st=8)
+	//   st2, total bytes so far is (st1=8,  st=16)
+	//   st2, total bytes so far is (st1=8,  st=24)
+	//   st2, total bytes so far is (st1=8,  st=32)
+	//   st2, total bytes so far is (st1=8,  st=40)  // 5x bandwidth
+	//   st1, total bytes so far is (st1=16, st=40)
+	//   st1, total bytes so far is (st1=24, st=40)
+	//   st1, total bytes so far is (st1=32, st=40)
+	//   st1, total bytes so far is (st1=40, st=40)
+	ws.Push(FrameWriteRequest{&writeData{1, make([]byte, 40), false}, st1, nil})
+	ws.Push(FrameWriteRequest{&writeData{2, make([]byte, 40), false}, st2, nil})
+	ws.AdjustStream(1, PriorityParam{StreamDep: 0, Weight: 0})
+	ws.AdjustStream(2, PriorityParam{StreamDep: 0, Weight: 255})
+
+	if err := checkPopAll(ws, []uint32{2, 1, 2, 2, 2, 2, 1, 1, 1, 1}); err != nil {
+		t.Error(err)
+	}
+}
+
 func TestPriorityRstStreamOnNonOpenStreams(t *testing.T) {
 	ws := NewPriorityWriteScheduler(&PriorityWriteSchedulerConfig{
 		MaxClosedNodesInTree: 0,
@@ -565,7 +600,7 @@ func TestPriorityRstStreamOnNonOpenStreams(t *testing.T) {
 
 // https://go.dev/issue/66514
 func TestPriorityIssue66514(t *testing.T) {
-	addDep := func(ws *priorityWriteScheduler, child uint32, parent uint32) {
+	addDep := func(ws *priorityWriteSchedulerRFC7540, child uint32, parent uint32) {
 		ws.AdjustStream(child, PriorityParam{
 			StreamDep: parent,
 			Exclusive: false,
@@ -573,7 +608,7 @@ func TestPriorityIssue66514(t *testing.T) {
 		})
 	}
 
-	validateDepTree := func(ws *priorityWriteScheduler, id uint32, t *testing.T) {
+	validateDepTree := func(ws *priorityWriteSchedulerRFC7540, id uint32, t *testing.T) {
 		for n := ws.nodes[id]; n != nil; n = n.parent {
 			if n.parent == nil {
 				if n.id != uint32(0) {
@@ -583,7 +618,7 @@ func TestPriorityIssue66514(t *testing.T) {
 		}
 	}
 
-	ws := NewPriorityWriteScheduler(nil).(*priorityWriteScheduler)
+	ws := NewPriorityWriteScheduler(nil).(*priorityWriteSchedulerRFC7540)
 
 	// Root entry
 	addDep(ws, uint32(1), uint32(0))

@@ -5,25 +5,33 @@
 // Infrastructure for testing ClientConn.RoundTrip.
 // Put actual tests in transport_test.go.
 
-package http2
+package http2_test
 
 import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"reflect"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/wi1dcard/fingerproxy/pkg/http2/internal/gate"
+	. "golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
 
 // TestTestClientConn demonstrates usage of testClientConn.
-func TestTestClientConn(t *testing.T) {
+func TestTestClientConn(t *testing.T) { synctestTest(t, testTestClientConn) }
+func testTestClientConn(t testing.TB) {
 	// newTestClientConn creates a *ClientConn and surrounding test infrastructure.
 	tc := newTestClientConn(t)
 
@@ -44,10 +52,13 @@ func TestTestClientConn(t *testing.T) {
 	req, _ := http.NewRequest("PUT", "https://dummy.tld/", body)
 	rt := tc.roundTrip(req)
 
+	// Note: rt.streamID can give the stream ID, but only with http2legacy.
+	streamID := uint32(1)
+
 	// tc has a number of methods to check for expected frames sent.
 	// Here, we look for headers and the request body.
 	tc.wantHeaders(wantHeader{
-		streamID:  rt.streamID(),
+		streamID:  streamID,
 		endStream: false,
 		header: http.Header{
 			":authority": []string{"dummy.tld"},
@@ -57,7 +68,7 @@ func TestTestClientConn(t *testing.T) {
 	})
 	// Expect 10 bytes of request body in DATA frames.
 	tc.wantData(wantData{
-		streamID:  rt.streamID(),
+		streamID:  streamID,
 		endStream: true,
 		size:      10,
 		multiple:  true,
@@ -65,7 +76,7 @@ func TestTestClientConn(t *testing.T) {
 
 	// tc.writeHeaders sends a HEADERS frame back to the client.
 	tc.writeHeaders(HeadersFrameParam{
-		StreamID:   rt.streamID(),
+		StreamID:   streamID,
 		EndHeaders: true,
 		EndStream:  true,
 		BlockFragment: tc.makeHeaderBlockFragment(
@@ -80,6 +91,48 @@ func TestTestClientConn(t *testing.T) {
 	rt.wantBody(nil)
 }
 
+func TestTestTransport(t *testing.T) {
+	synctestSubtest(t, "nethttp", func(t testing.TB) {
+		testTestTransport(t, roundTripNetHTTP)
+	})
+	synctestSubtest(t, "xnethttp2", func(t testing.TB) {
+		testTestTransport(t, roundTripXNetHTTP2)
+	})
+}
+func testTestTransport(t testing.TB, mode roundTripTestMode) {
+	tt := newTestTransport(t)
+
+	req := Must(http.NewRequest("GET", "https://dummy.tld/", nil))
+	rt := tt.roundTrip(req)
+	tc := tt.getConn()
+	tc.wantFrameType(FrameSettings)
+	tc.wantFrameType(FrameWindowUpdate)
+
+	tc.wantHeaders(wantHeader{
+		streamID:  1,
+		endStream: true,
+		header: http.Header{
+			":authority": []string{"dummy.tld"},
+			":method":    []string{"GET"},
+			":path":      []string{"/"},
+		},
+	})
+
+	tc.writeSettings()
+	tc.writeSettingsAck()
+	tc.wantFrameType(FrameSettings) // acknowledgement
+	tc.writeHeaders(HeadersFrameParam{
+		StreamID:   1,
+		EndHeaders: true,
+		EndStream:  true,
+		BlockFragment: tc.makeHeaderBlockFragment(
+			":status", "200",
+		),
+	})
+
+	rt.wantStatus(200)
+}
+
 // A testClientConn allows testing ClientConn.RoundTrip against a fake server.
 //
 // A test using testClientConn consists of:
@@ -90,60 +143,51 @@ func TestTestClientConn(t *testing.T) {
 // testClientConn manages synchronization, so tests can generally be written as
 // a linear sequence of actions and validations without additional synchronization.
 type testClientConn struct {
-	t *testing.T
+	t testing.TB
 
-	tr    *Transport
-	fr    *Framer
-	cc    *ClientConn
-	group *synctestGroup
+	tr  *Transport
+	fr  *Framer
+	cc  *ClientConn
+	cc1 *httpClientConn
 	testConnFramer
 
 	encbuf bytes.Buffer
 	enc    *hpack.Encoder
 
-	roundtrips []*testRoundTrip
-
-	netconn *synctestNetConn
+	netconn    *synctestNetConn
+	connReader *nonblockingReader
 }
 
-func newTestClientConnFromClientConn(t *testing.T, cc *ClientConn) *testClientConn {
+func newTestClientConnFromNetConn(tt *testTransport, nc net.Conn) *testClientConn {
 	tc := &testClientConn{
-		t:     t,
-		tr:    cc.t,
-		cc:    cc,
-		group: cc.t.transportTestHooks.group.(*synctestGroup),
+		t:  tt.t,
+		tr: tt.tr,
 	}
 
-	// srv is the side controlled by the test.
-	var srv *synctestNetConn
-	if cc.tconn == nil {
-		// If cc.tconn is nil, we're being called with a new conn created by the
-		// Transport's client pool. This path skips dialing the server, and we
-		// create a test connection pair here.
-		cc.tconn, srv = synctestNetPipe(tc.group)
+	var writer io.Writer
+	var reader io.Reader
+	if tt.useTLS {
+		tlsConfig := testTLSServerConfig.Clone()
+		tlsConfig.NextProtos = []string{"h2"}
+		tlsConn := tls.Server(nc, tlsConfig)
+		reader = tlsConn
+		writer = tlsConn
 	} else {
-		// If cc.tconn is non-nil, we're in a test which provides a conn to the
-		// Transport via a TLSNextProto hook. Extract the test connection pair.
-		if tc, ok := cc.tconn.(*tls.Conn); ok {
-			// Unwrap any *tls.Conn to the underlying net.Conn,
-			// to avoid dealing with encryption in tests.
-			cc.tconn = tc.NetConn()
-		}
-		srv = cc.tconn.(*synctestNetConn).peer
+		reader = nc
+		writer = nc
 	}
+	tc.connReader = newNonblockingReader(reader)
 
-	srv.SetReadDeadline(tc.group.Now())
-	srv.autoWait = true
-	tc.netconn = srv
+	tc.netconn = nc.(*synctestNetConn)
 	tc.enc = hpack.NewEncoder(&tc.encbuf)
-	tc.fr = NewFramer(srv, srv)
+	tc.fr = NewFramer(writer, tc.connReader)
 	tc.testConnFramer = testConnFramer{
-		t:   t,
+		t:   tt.t,
 		fr:  tc.fr,
-		dec: hpack.NewDecoder(initialHeaderTableSize, nil),
+		dec: hpack.NewDecoder(InitialHeaderTableSize, nil),
 	}
 	tc.fr.SetMaxReadFrameSize(10 << 20)
-	t.Cleanup(func() {
+	tt.t.Cleanup(func() {
 		tc.closeWrite()
 	})
 
@@ -153,47 +197,25 @@ func newTestClientConnFromClientConn(t *testing.T, cc *ClientConn) *testClientCo
 func (tc *testClientConn) readClientPreface() {
 	tc.t.Helper()
 	// Read the client's HTTP/2 preface, sent prior to any HTTP/2 frames.
-	buf := make([]byte, len(clientPreface))
-	if _, err := io.ReadFull(tc.netconn, buf); err != nil {
+	synctest.Wait()
+	buf := make([]byte, len(ClientPreface))
+	if _, err := io.ReadFull(tc.connReader, buf); err != nil {
 		tc.t.Fatalf("reading preface: %v", err)
 	}
-	if !bytes.Equal(buf, clientPreface) {
-		tc.t.Fatalf("client preface: %q, want %q", buf, clientPreface)
+	if !bytes.Equal(buf, []byte(ClientPreface)) {
+		tc.t.Fatalf("client preface: %q, want %q", buf, ClientPreface)
 	}
-}
-
-func newTestClientConn(t *testing.T, opts ...any) *testClientConn {
-	t.Helper()
-
-	tt := newTestTransport(t, opts...)
-	const singleUse = false
-	_, err := tt.tr.newClientConn(nil, singleUse)
-	if err != nil {
-		t.Fatalf("newClientConn: %v", err)
-	}
-
-	return tt.getConn()
-}
-
-// sync waits for the ClientConn under test to reach a stable state,
-// with all goroutines blocked on some input.
-func (tc *testClientConn) sync() {
-	tc.group.Wait()
-}
-
-// advance advances synthetic time by a duration.
-func (tc *testClientConn) advance(d time.Duration) {
-	tc.group.AdvanceTime(d)
-	tc.sync()
 }
 
 // hasFrame reports whether a frame is available to be read.
 func (tc *testClientConn) hasFrame() bool {
-	return len(tc.netconn.Peek()) > 0
+	synctest.Wait()
+	return tc.connReader.buf.Len() > 0
 }
 
 // isClosed reports whether the peer has closed the connection.
 func (tc *testClientConn) isClosed() bool {
+	synctest.Wait()
 	return tc.netconn.IsClosedByPeer()
 }
 
@@ -203,10 +225,17 @@ func (tc *testClientConn) closeWrite() {
 	tc.netconn.Close()
 }
 
+// closeWrite causes the net.Conn used by the ClientConn to return a error
+// from Write calls.
+func (tc *testClientConn) closeWriteWithError(err error) {
+	tc.netconn.loc.setReadError(io.EOF)
+	tc.netconn.loc.setWriteError(err)
+}
+
 // testRequestBody is a Request.Body for use in tests.
 type testRequestBody struct {
 	tc   *testClientConn
-	gate gate
+	gate gate.Gate
 
 	// At most one of buf or bytes can be set at any given time:
 	buf   bytes.Buffer // specific bytes to read from the body
@@ -218,18 +247,18 @@ type testRequestBody struct {
 func (tc *testClientConn) newRequestBody() *testRequestBody {
 	b := &testRequestBody{
 		tc:   tc,
-		gate: newGate(),
+		gate: gate.New(false),
 	}
 	return b
 }
 
 func (b *testRequestBody) unlock() {
-	b.gate.unlock(b.buf.Len() > 0 || b.bytes > 0 || b.err != nil)
+	b.gate.Unlock(b.buf.Len() > 0 || b.bytes > 0 || b.err != nil)
 }
 
 // Read is called by the ClientConn to read from a request body.
 func (b *testRequestBody) Read(p []byte) (n int, _ error) {
-	if err := b.gate.waitAndLock(context.Background()); err != nil {
+	if err := b.gate.WaitAndLock(context.Background()); err != nil {
 		return 0, err
 	}
 	defer b.unlock()
@@ -257,18 +286,18 @@ func (b *testRequestBody) Close() error {
 
 // writeBytes adds n arbitrary bytes to the body.
 func (b *testRequestBody) writeBytes(n int) {
-	defer b.tc.sync()
-	b.gate.lock()
+	defer synctest.Wait()
+	b.gate.Lock()
 	defer b.unlock()
 	b.bytes += n
 	b.checkWrite()
-	b.tc.sync()
+	synctest.Wait()
 }
 
 // Write adds bytes to the body.
 func (b *testRequestBody) Write(p []byte) (int, error) {
-	defer b.tc.sync()
-	b.gate.lock()
+	defer synctest.Wait()
+	b.gate.Lock()
 	defer b.unlock()
 	n, err := b.buf.Write(p)
 	b.checkWrite()
@@ -286,8 +315,8 @@ func (b *testRequestBody) checkWrite() {
 
 // closeWithError sets an error which will be returned by Read.
 func (b *testRequestBody) closeWithError(err error) {
-	defer b.tc.sync()
-	b.gate.lock()
+	defer synctest.Wait()
+	b.gate.Lock()
 	defer b.unlock()
 	b.err = err
 }
@@ -297,21 +326,41 @@ func (b *testRequestBody) closeWithError(err error) {
 // (Note that the RoundTrip won't complete until response headers are received,
 // the request times out, or some other terminal condition is reached.)
 func (tc *testClientConn) roundTrip(req *http.Request) *testRoundTrip {
-	rt := &testRoundTrip{
-		t:     tc.t,
-		donec: make(chan struct{}),
-	}
-	tc.roundtrips = append(tc.roundtrips, rt)
-	go func() {
-		tc.group.Join()
-		defer close(rt.donec)
-		rt.resp, rt.respErr = tc.cc.roundTrip(req, func(cs *clientStream) {
-			rt.id.Store(cs.ID)
+	rt := &testRoundTrip{}
+	rt.do(tc.t, req, func(req *http.Request) (*http.Response, error) {
+		// doRoundTrip will pick a way to make a RoundTrip call
+		// depending on the Go version and whether we're
+		// wrapping the net/http implementation or using the one in this package.
+		return tc.doRoundTrip(req, func(streamID uint32) {
+			rt.id.Store(streamID)
 		})
-	}()
-	tc.sync()
+	})
+	return rt
+}
 
-	tc.t.Cleanup(func() {
+func newTestRoundTrip(t testing.TB, req *http.Request, f func(*http.Request) (*http.Response, error)) *testRoundTrip {
+	rt := &testRoundTrip{}
+	rt.do(t, req, f)
+	return rt
+}
+
+func (rt *testRoundTrip) do(t testing.TB, req *http.Request, f func(*http.Request) (*http.Response, error)) {
+	if rt.t != nil {
+		t.Fatal("testRoundTrip can only be used once")
+	}
+	ctx, cancel := context.WithCancel(req.Context())
+	req = req.WithContext(ctx)
+	rt.t = t
+	rt.donec = make(chan struct{})
+	rt.cancel = cancel
+	go func() {
+		defer close(rt.donec)
+		rt.resp, rt.respErr = f(req)
+	}()
+	synctest.Wait()
+
+	t.Cleanup(func() {
+		rt.cancel()
 		if !rt.done() {
 			return
 		}
@@ -320,8 +369,6 @@ func (tc *testClientConn) roundTrip(req *http.Request) *testRoundTrip {
 			res.Body.Close()
 		}
 	})
-
-	return rt
 }
 
 func (tc *testClientConn) greet(settings ...Setting) {
@@ -335,7 +382,7 @@ func (tc *testClientConn) greet(settings ...Setting) {
 // makeHeaderBlockFragment encodes headers in a form suitable for inclusion
 // in a HEADERS or CONTINUATION frame.
 //
-// It takes a list of alernating names and values.
+// It takes a list of alternating names and values.
 func (tc *testClientConn) makeHeaderBlockFragment(s ...string) []byte {
 	if len(s)%2 != 0 {
 		tc.t.Fatalf("uneven list of header name/value pairs")
@@ -347,33 +394,19 @@ func (tc *testClientConn) makeHeaderBlockFragment(s ...string) []byte {
 	return tc.encbuf.Bytes()
 }
 
-// inflowWindow returns the amount of inbound flow control available for a stream,
-// or for the connection if streamID is 0.
-func (tc *testClientConn) inflowWindow(streamID uint32) int32 {
-	tc.cc.mu.Lock()
-	defer tc.cc.mu.Unlock()
-	if streamID == 0 {
-		return tc.cc.inflow.avail + tc.cc.inflow.unsent
-	}
-	cs := tc.cc.streams[streamID]
-	if cs == nil {
-		tc.t.Errorf("no stream with id %v", streamID)
-		return -1
-	}
-	return cs.inflow.avail + cs.inflow.unsent
-}
-
 // testRoundTrip manages a RoundTrip in progress.
 type testRoundTrip struct {
-	t       *testing.T
+	t       testing.TB
 	resp    *http.Response
 	respErr error
 	donec   chan struct{}
 	id      atomic.Uint32
+	cancel  context.CancelFunc
 }
 
 // streamID returns the HTTP/2 stream ID of the request.
 func (rt *testRoundTrip) streamID() uint32 {
+	synctest.Wait()
 	id := rt.id.Load()
 	if id == 0 {
 		panic("stream ID unknown")
@@ -383,6 +416,7 @@ func (rt *testRoundTrip) streamID() uint32 {
 
 // done reports whether RoundTrip has returned.
 func (rt *testRoundTrip) done() bool {
+	synctest.Wait()
 	select {
 	case <-rt.donec:
 		return true
@@ -395,6 +429,7 @@ func (rt *testRoundTrip) done() bool {
 func (rt *testRoundTrip) result() (*http.Response, error) {
 	t := rt.t
 	t.Helper()
+	synctest.Wait()
 	select {
 	case <-rt.donec:
 	default:
@@ -435,7 +470,7 @@ func (rt *testRoundTrip) wantStatus(want int) {
 	}
 }
 
-// body reads the contents of the response body.
+// readBody reads the contents of the response body.
 func (rt *testRoundTrip) readBody() ([]byte, error) {
 	t := rt.t
 	t.Helper()
@@ -489,98 +524,219 @@ func diffHeaders(got, want http.Header) string {
 	return fmt.Sprintf("got:  %v\nwant: %v", got, want)
 }
 
+// roundTripTestMode selects which RoundTrip API a test uses.
+type roundTripTestMode int
+
+const (
+	// roundTripNetHTTP uses net/http.Transport.RoundTrip or
+	// net/http.ClientConn.RoundTrip:
+	//
+	//	t1 := http.Transport{}
+	//	t2 := ConfigureTransports(t1)
+	//	resp, err := t1.RoundTrip(req)
+	//
+	roundTripNetHTTP = roundTripTestMode(iota)
+
+	// roundTripXNetHTTP2 uses x/net/http2.Transport.RoundTrip or
+	// x/net/http2.ClientConn.RoundTrip:
+	//
+	//	t2 := http2.Transport{}
+	//	resp, err := t2.RoundTrip(req)
+	roundTripXNetHTTP2
+)
+
 // A testTransport allows testing Transport.RoundTrip against fake servers.
 // Tests that aren't specifically exercising RoundTrip's retry loop or connection pooling
 // should use testClientConn instead.
 type testTransport struct {
-	t     *testing.T
-	tr    *Transport
-	group *synctestGroup
+	t    testing.TB
+	tr   *Transport
+	tr1  *http.Transport
+	li   *synctestNetListener
+	mode roundTripTestMode
 
-	ccs []*testClientConn
+	ccMu    sync.Mutex
+	ccqueue []*testClientConn
+	ccs     map[*synctestNetConn]*testClientConn
+
+	ccpending []*testPendingClientConn
+
+	useTLS bool
 }
 
-func newTestTransport(t *testing.T, opts ...any) *testTransport {
-	tt := &testTransport{
-		t:     t,
-		group: newSynctest(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)),
-	}
-	tt.group.Join()
+type testPendingClientConn struct {
+	nc *synctestNetConn
+	cc *ClientConn
+	tc *testClientConn
+}
 
-	tr := &Transport{}
+func newTestTransport(t testing.TB, opts ...any) *testTransport {
+	tt := &testTransport{
+		t:    t,
+		li:   newSynctestNetListener(),
+		ccs:  make(map[*synctestNetConn]*testClientConn),
+		mode: roundTripXNetHTTP2,
+	}
+
+	for _, o := range opts {
+		switch o := o.(type) {
+		case roundTripTestMode:
+			tt.mode = o
+		}
+	}
+
+	var (
+		tr  *Transport
+		tr1 *http.Transport
+	)
+	switch tt.mode {
+	case roundTripXNetHTTP2:
+		tr = &Transport{
+			DialTLSContext: func(ctx context.Context, network, address string, tlsConf *tls.Config) (net.Conn, error) {
+				if tt.useTLS {
+					return tls.Client(tt.li.newConn(), tlsConf), nil
+				}
+				return tt.li.newConn(), nil
+			},
+			TLSClientConfig: testTLSClientConfig,
+			AllowHTTP:       true,
+		}
+		tr1 = tr.TestTransport()
+	case roundTripNetHTTP:
+		tr1 = &http.Transport{}
+	}
+
+	tr1.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return tt.li.newConn(), nil
+	}
+	tr1.TLSClientConfig = testTLSClientConfig
+	tr1.Protocols = &http.Protocols{}
+	tr1.Protocols.SetHTTP2(true)
+	tr1.Protocols.SetUnencryptedHTTP2(true)
+	t.Cleanup(tr1.CloseIdleConnections)
+
+	if tt.mode == roundTripNetHTTP {
+		var err error
+		tr, err = ConfigureTransports(tr1)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	for _, o := range opts {
 		switch o := o.(type) {
 		case func(*http.Transport):
-			if tr.t1 == nil {
-				tr.t1 = &http.Transport{}
-			}
-			o(tr.t1)
+			o(tr.TestTransport())
 		case func(*Transport):
 			o(tr)
 		case *Transport:
 			tr = o
+		case roundTripTestMode:
+			tt.mode = o
+		case nil:
+		default:
+			t.Fatalf("unsupported option %T", o)
 		}
 	}
 	tt.tr = tr
+	tt.tr1 = tr.TestTransport()
 
-	tr.transportTestHooks = &transportTestHooks{
-		group: tt.group,
-		newclientconn: func(cc *ClientConn) {
-			tc := newTestClientConnFromClientConn(t, cc)
-			tt.ccs = append(tt.ccs, tc)
-		},
-	}
+	go tt.accept()
+
+	// Install internal hooks when using the HTTP/2 implementation in this package.
+	// This is a no-op when wrapping net/http's imeplementation.
+	tt.maybeAddNewClientConnHook()
 
 	t.Cleanup(func() {
-		tt.sync()
-		if len(tt.ccs) > 0 {
-			t.Fatalf("%v test ClientConns created, but not examined by test", len(tt.ccs))
+		tt.li.Close()
+		synctest.Wait()
+		if len(tt.ccqueue) > 0 {
+			t.Fatalf("%v test ClientConns created, but not examined by test", len(tt.ccqueue))
 		}
-		tt.group.Close(t)
 	})
 
 	return tt
 }
 
-func (tt *testTransport) sync() {
-	tt.group.Wait()
+func (tt *testTransport) addPending(nc *synctestNetConn, cc *ClientConn, tc *testClientConn) {
+	tt.ccMu.Lock()
+	defer tt.ccMu.Unlock()
+
+	for i, p := range tt.ccpending {
+		if p.nc != nc {
+			break
+		}
+		if p.tc != nil {
+			p.tc.cc = cc
+		} else if tc != nil {
+			tc.cc = p.cc
+		} else {
+			panic("found matching ccpending for conn with no tc")
+		}
+		tt.ccpending = slices.Delete(tt.ccpending, i, i+1)
+		return
+	}
+
+	tt.ccpending = append(tt.ccpending, &testPendingClientConn{
+		nc: nc,
+		cc: cc,
+		tc: tc,
+	})
 }
 
-func (tt *testTransport) advance(d time.Duration) {
-	tt.group.AdvanceTime(d)
-	tt.sync()
+func (tt *testTransport) accept() {
+	for {
+		nc, err := tt.li.Accept()
+		if err != nil {
+			return
+		}
+		tc := newTestClientConnFromNetConn(tt, nc)
+		tt.addPending(nc.(*synctestNetConn), nil, tc)
+		tt.ccqueue = append(tt.ccqueue, tc)
+	}
 }
 
 func (tt *testTransport) hasConn() bool {
-	return len(tt.ccs) > 0
+	return len(tt.ccqueue) > 0
 }
 
 func (tt *testTransport) getConn() *testClientConn {
 	tt.t.Helper()
-	if len(tt.ccs) == 0 {
+	synctest.Wait()
+	tt.ccMu.Lock()
+	if len(tt.ccqueue) == 0 {
+		tt.ccMu.Unlock()
 		tt.t.Fatalf("no new ClientConns created; wanted one")
 	}
-	tc := tt.ccs[0]
-	tt.ccs = tt.ccs[1:]
-	tc.sync()
+	tc := tt.ccqueue[0]
+	tt.ccqueue = tt.ccqueue[1:]
+	tt.ccMu.Unlock()
 	tc.readClientPreface()
-	tc.sync()
 	return tc
 }
 
 func (tt *testTransport) roundTrip(req *http.Request) *testRoundTrip {
+	ctx, cancel := context.WithCancel(req.Context())
+	req = req.WithContext(ctx)
 	rt := &testRoundTrip{
-		t:     tt.t,
-		donec: make(chan struct{}),
+		t:      tt.t,
+		donec:  make(chan struct{}),
+		cancel: cancel,
 	}
+
 	go func() {
-		tt.group.Join()
 		defer close(rt.donec)
-		rt.resp, rt.respErr = tt.tr.RoundTrip(req)
+		switch tt.mode {
+		case roundTripXNetHTTP2:
+			rt.resp, rt.respErr = tt.tr.RoundTrip(req)
+		case roundTripNetHTTP:
+			rt.resp, rt.respErr = tt.tr1.RoundTrip(req)
+		}
 	}()
-	tt.sync()
+	synctest.Wait()
 
 	tt.t.Cleanup(func() {
+		rt.cancel()
 		if !rt.done() {
 			return
 		}
@@ -592,3 +748,102 @@ func (tt *testTransport) roundTrip(req *http.Request) *testRoundTrip {
 
 	return rt
 }
+
+type nonblockingReader struct {
+	mu    sync.Mutex
+	buf   bytes.Buffer
+	err   error
+	waitc chan struct{}
+	stopc chan struct{}
+}
+
+func newNonblockingReader(reader io.Reader) *nonblockingReader {
+	r := &nonblockingReader{}
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, err := reader.Read(buf)
+			r.mu.Lock()
+			if n > 0 {
+				r.buf.Write(buf[:n])
+			}
+			if err != nil {
+				r.err = err
+			}
+			if r.waitc != nil {
+				close(r.waitc)
+				r.waitc = nil
+			}
+			stopc := r.stopc
+			r.mu.Unlock()
+			if err != nil {
+				return
+			}
+			if stopc != nil {
+				<-stopc
+			}
+		}
+	}()
+	return r
+}
+
+func (r *nonblockingReader) Read(p []byte) (n int, err error) {
+	synctest.Wait()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n, err = r.buf.Read(p)
+	if err == io.EOF {
+		if r.err != nil {
+			err = r.err
+		} else {
+			err = errWouldBlock
+		}
+	}
+	return n, err
+}
+
+func (r *nonblockingReader) waitForData(t testing.TB) time.Duration {
+	t.Helper()
+	synctest.Wait()
+	waitc := func() chan struct{} {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.buf.Len() > 0 || r.err != nil {
+			return nil
+		}
+		if r.waitc == nil {
+			r.waitc = make(chan struct{})
+		}
+		return r.waitc
+	}()
+	if waitc == nil {
+		return 0
+	}
+	start := time.Now()
+	select {
+	case <-waitc:
+	case <-time.After(1 * time.Hour):
+		t.Fatalf("waited an hour for connection data, saw none")
+	}
+	return time.Since(start)
+}
+
+func (r *nonblockingReader) stop() {
+	synctest.Wait()
+	if r.stopc != nil {
+		panic("stopping stopped reader")
+	}
+	r.stopc = make(chan struct{})
+}
+
+func (r *nonblockingReader) start() {
+	synctest.Wait()
+	if r.stopc == nil {
+		panic("starting started reader")
+	}
+	stopc := r.stopc
+	r.stopc = nil
+	close(stopc)
+}
+
+var errWouldBlock = errors.New("would block")
