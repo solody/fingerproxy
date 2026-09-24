@@ -71,3 +71,15 @@ func (p *HTTP2FingerprintParam) HTTP2Fingerprint(data *metadata.Metadata) (strin
 	vlogf("%s connection, skipping HTTP2 fingerprinting", data.ConnectionState.NegotiatedProtocol)
 	return "", nil
 }
+
+// HTTP2HeaderOrder is a FingerprintFunc that returns the HTTP/2 header name
+// order string captured from the HEADERS frame.
+func HTTP2HeaderOrder(data *metadata.Metadata) (string, error) {
+	if data.ConnectionState.NegotiatedProtocol == "h2" {
+		vlogf("http2 header order: %s", data.HTTP2Frames.HeaderOrder)
+		return data.HTTP2Frames.HeaderOrder, nil
+	}
+
+	vlogf("%s connection, skipping HTTP2 header order", data.ConnectionState.NegotiatedProtocol)
+	return "", nil
+}

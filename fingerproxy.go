@@ -50,8 +50,8 @@ var (
 )
 
 // DefaultHeaderInjectors is the default header injector set that injects JA3, JA4,
-// and Akamai HTTP2 fingerprints. Override [fingerproxy.GetHeaderInjectors] to replace
-// this to your own injectors.
+// Akamai HTTP2 fingerprints, and HTTP2 header order. Override
+// [fingerproxy.GetHeaderInjectors] to replace this to your own injectors.
 func DefaultHeaderInjectors() []reverseproxy.HeaderInjector {
 	h2fp := &fp.HTTP2FingerprintParam{}
 	if flagMaxHTTP2PriorityFrames == nil { // if CLI flags are not initialized
@@ -64,6 +64,7 @@ func DefaultHeaderInjectors() []reverseproxy.HeaderInjector {
 		fp.NewFingerprintHeaderInjector("X-JA3-Fingerprint", fp.JA3Fingerprint),
 		fp.NewFingerprintHeaderInjector("X-JA4-Fingerprint", fp.JA4Fingerprint),
 		fp.NewFingerprintHeaderInjector("X-HTTP2-Fingerprint", h2fp.HTTP2Fingerprint),
+		fp.NewFingerprintHeaderInjector("X-HTTP2-Header-Order", fp.HTTP2HeaderOrder),
 	}
 }
 

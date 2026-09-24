@@ -1,6 +1,7 @@
 #!/bin/bash -x
 
-SAN=example.com
+#SAN=example.com
+SAN=localhost
 
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 -days 3650 \
   -nodes -keyout tls.key -out tls.crt -subj "/CN=$SAN" \
